@@ -126,17 +126,72 @@ static void streamingTask(void *pvParameters) {
         Serial.printf("Streamer: client connected from %s\n", client.remoteIP().toString().c_str());
         client.setNoDelay(true);
 
+        // TODO: Potential VLC behavior workaround — read request headers
+        // Wait briefly for request data to arrive (avoid infinite block)
+        unsigned long wait_deadline = millis() + 200;
+        while (!client.available() && millis() < wait_deadline && client.connected()) {
+            vTaskDelay(1 / portTICK_PERIOD_MS);
+        }
+
+        // --- Robustly read and discard the client's HTTP request headers ---
+        unsigned long total_deadline = millis() + 1000; // wait up to 1s for headers
+        String requestLine;
+        bool firstLineLogged = false;
+        bool headers_done = false;
+        while (client.connected() && millis() < total_deadline && !headers_done) {
+            while (client.available()) {
+                String line = client.readStringUntil('\n'); // reads up to '\n'
+                // trim trailing CR for easier checks
+                if (line.endsWith("\r")) line.remove(line.length() - 1);
+                if (!firstLineLogged) {
+                    requestLine = line;
+                    Serial.printf("Streamer: request first line: %s\n", requestLine.c_str());
+                    firstLineLogged = true;
+                }
+                // end of headers: blank line
+                if (line.length() == 0) {
+                    headers_done = true;
+                    break;
+                }
+                // continue reading remaining header lines
+            }
+            if (!headers_done) vTaskDelay(5 / portTICK_PERIOD_MS);
+        }
+        if (!firstLineLogged) {
+            Serial.println("Streamer: no request headers received (timeout), proceeding to respond");
+        } else if (!headers_done) {
+            Serial.println("Streamer: header read timed out but proceeding to respond");
+        }
+
         // Send HTTP headers + raw WAV header (no Content-Length; keep connection open)
-        // Some players accept this pattern for live streams.
         client.print("HTTP/1.1 200 OK\r\n");
         client.print("Content-Type: audio/wav\r\n");
-        client.print("Connection: close\r\n");
+        client.print("Cache-Control: no-cache\r\n");
+        client.print("Connection: keep-alive\r\n");
         client.print("\r\n");
-        // send the WAV header bytes directly
-        client.write(wavHeader, sizeof(wavHeader));
-
-        // Stream loop
-        while (client && client.connected()) {
+        
+        // WAV header: sample rate = 16000 (0x00003E80 -> bytes 0x80,0x3E,0x00,0x00)
+        byte streamingWavHeader[44] = {
+            0x52,0x49,0x46,0x46, 0xFF,0xFF,0xFF,0xFF,
+            0x57,0x41,0x56,0x45,
+            0x66,0x6D,0x74,0x20,
+            0x10,0x00,0x00,0x00,
+            0x01,0x00,
+            0x01,0x00,
+            0x80,0x3E,0x00,0x00, // SampleRate (16000) little-endian
+            0x00,0x7D,0x00,0x00, // ByteRate (32000) little-endian
+            0x02,0x00,
+            0x10,0x00,
+            0x64,0x61,0x74,0x61,
+            0xFF,0xFF,0xFF,0xFF
+        };
+        client.write(streamingWavHeader, sizeof(streamingWavHeader));
+         // Ensure header bytes are flushed to client
+         client.flush();
+         Serial.println("Streamer: response headers & WAV header sent, entering stream loop");
+ 
+         // Stream loop
+         while (client && client.connected()) {
             size_t bytes_read = 0;
             // bounded timeout so this task yields occasionally
             esp_err_t r = i2s_read(I2S_PORT, i2s_read_buff, i2s_read_len * sizeof(int32_t), &bytes_read, 100 / portTICK_PERIOD_MS);
@@ -154,6 +209,8 @@ static void streamingTask(void *pvParameters) {
             // Allocate small temp buffer on stack (pairs <= 128 here)
             int16_t outbuf[128];
             int out_count = pairs;
+
+            // TODO: Simplify this abomination 
             if (out_count > (int)(sizeof(outbuf)/sizeof(outbuf[0]))) out_count = (int)(sizeof(outbuf)/sizeof(outbuf[0]));
 
             for (int i = 0; i < out_count; ++i) {
@@ -182,9 +239,15 @@ static void streamingTask(void *pvParameters) {
                 sent += (size_t)w;
             }
 
-            // small yield to allow WiFi and other tasks to run
-            taskYIELD();
-        }
+            // TODO: Debugging
+            static bool firstAudioSent = false;
+            if (!firstAudioSent && sent > 0) {
+                Serial.printf("Streamer: first audio block sent (%u bytes)\n", (unsigned)sent);
+                firstAudioSent = true;
+            }
+             // yield to allow WiFi and other tasks to run
+             taskYIELD();
+         }
 
         if (client) {
             client.stop();

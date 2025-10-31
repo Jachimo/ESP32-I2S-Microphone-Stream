@@ -4,4 +4,4 @@ A fork of Sadteeto's [ESP32 I2S Microphone Stream](https://github.com/Sadteeto/E
 with changes to support cheap INMP441 omnidirectional I2S microphones.
 
 Streams I2S microphone audio to your browser:   
-`http://YOUR.IP.ADDRE.SS/stream`   
+`http://YOUR.IP.ADDRE.SS:8080/`   
