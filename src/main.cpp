@@ -91,7 +91,7 @@ static void I2SSetup(void)
 
 // Function to send the WAV header to the client
 void sendWavHeader() {
-    // 32-bit PCM, mono, 44100 Hz
+    // 16-bit PCM, mono, 44100 Hz
     byte header[44] = {
         0x52, 0x49, 0x46, 0x46, // RIFF
         0xFF, 0xFF, 0xFF, 0xFF, // File size, placeholder to be replaced
@@ -101,9 +101,9 @@ void sendWavHeader() {
         0x01, 0x00,             // AudioFormat (PCM = 1)
         0x01, 0x00,             // NumChannels (Mono = 1)
         0x44, 0xAC, 0x00, 0x00, // SampleRate (44100 Hz)
-        0x10, 0xB1, 0x02, 0x00, // ByteRate (44100 * 1 * 32/8 = 176400)
-        0x04, 0x00,             // BlockAlign (1 * 32/8 = 4)
-        0x20, 0x00,             // BitsPerSample (32)
+        0x88, 0x58, 0x01, 0x00, // ByteRate (44100 * 1 * 16/8 = 88200)
+        0x02, 0x00,             // BlockAlign (1 * 16/8 = 2)
+        0x10, 0x00,             // BitsPerSample (16)
         0x64, 0x61, 0x74, 0x61, // data
         0xFF, 0xFF, 0xFF, 0xFF  // Subchunk2Size (data size, placeholder to be replaced)
     };
@@ -132,8 +132,8 @@ void handleAudioStream() {
         if (i2s_read_result == ESP_OK && bytes_read > 0) {
             // Log bytes read and a small stereo sample dump (Left,Right pairs)
             Serial.printf("I2S read bytes: %u\n", (unsigned)bytes_read);
-            int samples = bytes_read / sizeof(int32_t);
-            int pairs = samples / 2;
+            int samples = bytes_read / sizeof(int32_t); // total slot samples
+            int pairs = samples / 2;                    // stereo pairs
             int dump = pairs < 8 ? pairs : 8;
             Serial.print("Sample pairs (L,R): ");
             for (int i = 0; i < dump; ++i) {
@@ -143,12 +143,38 @@ void handleAudioStream() {
             }
             Serial.println();
  
-            // send raw bytes to client socket
+            // Convert stereo 32-bit (left-justified 24-in-32) -> mono 16-bit (left channel)
+            int out_count = pairs; // one mono sample per pair
+            // allocate on stack if size reasonable; otherwise use a static buffer or malloc
+            int16_t outbuf[512]; // ensure large enough for i2s_read_len=1024 -> pairs=512
+            if (out_count > (int)(sizeof(outbuf)/sizeof(outbuf[0]))) {
+                out_count = (int)(sizeof(outbuf)/sizeof(outbuf[0])); // clamp to buffer
+            }
+            for (int i = 0; i < out_count; ++i) {
+                int32_t left = i2s_read_buff[i*2];
+                // INMP441 provides 24-bit left-justified in 32 bits; shift right 8 to get 16-bit
+                int16_t s16 = (int16_t)(left >> 8);
+                outbuf[i] = s16;
+            }
+            size_t bytes_to_send = out_count * sizeof(int16_t);
+ 
+            // debug dump first few 16-bit samples
+            Serial.print("Output 16-bit samples: ");
+            int dump16 = out_count < 8 ? out_count : 8;
+            for (int i = 0; i < dump16; ++i) {
+                Serial.printf("%04X ", (uint16_t)outbuf[i]);
+            }
+            Serial.println();
+ 
+            // send converted 16-bit mono audio bytes to client socket
             WiFiClient client = server.client();
             if (client && client.connected()) {
                 size_t written = 0;
-                while (written < bytes_read) {
-                    written += client.write(((const uint8_t*)i2s_read_buff) + written, bytes_read - written);
+                const uint8_t* src = (const uint8_t*)outbuf;
+                while (written < bytes_to_send) {
+                    int w = client.write(src + written, bytes_to_send - written);
+                    if (w <= 0) break;
+                    written += w;
                 }
             }
          }
