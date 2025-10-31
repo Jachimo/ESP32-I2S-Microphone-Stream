@@ -186,22 +186,98 @@ void handleAudioStream() {
      }
  }
  
+// Helper: map WiFi.status() to readable text
+static const char* wifiStatusStr(wl_status_t s) {
+    switch (s) {
+        case WL_IDLE_STATUS:      return "WL_IDLE_STATUS";
+        case WL_NO_SSID_AVAIL:    return "WL_NO_SSID_AVAIL";
+        case WL_SCAN_COMPLETED:   return "WL_SCAN_COMPLETED";
+        case WL_CONNECTED:        return "WL_CONNECTED";
+        case WL_CONNECT_FAILED:   return "WL_CONNECT_FAILED";
+        case WL_CONNECTION_LOST:  return "WL_CONNECTION_LOST";
+        case WL_DISCONNECTED:     return "WL_DISCONNECTED";
+        default:                  return "WL_UNKNOWN";
+    }
+}
+
 void setup() {
     Serial.begin(115200);
     I2SSetup();
 
-    WiFi.begin(ssid, password);
-    while (WiFi.status() != WL_CONNECTED) {
-        delay(1000);
-        Serial.println("Connecting to WiFi...");
+    Serial.println();
+    Serial.println("=== WiFi connect sequence ===");
+    Serial.printf("Attempting to connect to SSID: '%s'\n", ssid);
+    Serial.printf("Device MAC: %s\n", WiFi.macAddress().c_str());
+
+    WiFi.mode(WIFI_STA);
+    WiFi.setAutoReconnect(true);
+
+    // Do a single scan up-front so we can report whether the AP is visible.
+    Serial.println("Performing initial WiFi scan...");
+    int n = WiFi.scanNetworks();
+    bool ssid_found = false;
+    if (n == 0) {
+        Serial.println("  No networks found in initial scan.");
+    } else {
+        for (int i = 0; i < n; ++i) {
+            String foundSsid = WiFi.SSID(i);
+            int rssi = WiFi.RSSI(i);
+            String enc = (WiFi.encryptionType(i) == WIFI_AUTH_OPEN) ? "open" : "secure";
+            Serial.printf("  %d: %s (%d dBm) %s\n", i, foundSsid.c_str(), rssi, enc.c_str());
+            if (foundSsid == ssid) {
+                Serial.printf("    -> Target SSID '%s' FOUND (RSSI=%d dBm)\n", foundSsid.c_str(), rssi);
+                ssid_found = true;
+            }
+        }
     }
-    Serial.println("Connected to WiFi");
+    WiFi.scanDelete();
+    if (!ssid_found) {
+        Serial.printf("Warning: target SSID '%s' not seen in scan. It may be hidden or out of range.\n", ssid);
+    }
 
+    const int max_retries = 300;
+    const unsigned long connect_timeout_ms = 180UL * 1000UL; // 180 seconds per attempt
+    bool connected = false;
+
+    for (int attempt = 1; attempt <= max_retries && !connected; ++attempt) {
+        Serial.printf("Connect attempt %d/%d: calling WiFi.begin()\n", attempt, max_retries);
+        WiFi.begin(ssid, password);
+
+        unsigned long start_ms = millis();
+        while (millis() - start_ms < connect_timeout_ms) {
+            wl_status_t st = WiFi.status();
+            unsigned long elapsed_s = (millis() - start_ms) / 1000;
+            Serial.printf("  WiFi status: %s (0x%02X), elapsed %lus\n", wifiStatusStr(st), (int)st, elapsed_s);
+            if (st == WL_CONNECTED) {
+                connected = true;
+                break;
+            }
+            delay(1000);
+        }
+
+        if (!connected) {
+            Serial.printf("  Attempt %d timed out after %lus. Disconnecting and retrying...\n", attempt, connect_timeout_ms / 1000UL);
+            WiFi.disconnect(true, true); // disconnect and erase AP info to force a fresh attempt
+            delay(500);
+        }
+    }
+
+    if (connected && WiFi.status() == WL_CONNECTED) {
+        Serial.println("Connected to WiFi");
+        Serial.printf("IP: %s\n", WiFi.localIP().toString().c_str());
+        Serial.printf("Gateway: %s\n", WiFi.gatewayIP().toString().c_str());
+        Serial.printf("Subnet: %s\n", WiFi.subnetMask().toString().c_str());
+        Serial.printf("RSSI: %d dBm\n", WiFi.RSSI());
+    } else {
+        Serial.printf("Final WiFi status after retries: %s (0x%02X)\n", wifiStatusStr(WiFi.status()), (int)WiFi.status());
+        Serial.println("Giving up connecting to WiFi. Check SSID/password, visibility, and AP signal.");
+    }
+
+    // Register HTTP handler and start server
     server.on("/stream", HTTP_GET, handleAudioStream);
-
     server.begin();
 }
 
 void loop() {
-    server.handleClient();
+    // All work is done in the audio stream handler
 }
