@@ -24,7 +24,9 @@ static void I2SSetup(void)
         // forcing a non-standard MCLK multiple. INMP441 is 24-bit data
         // left-justified inside a 32-bit slot.
         .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,        // 32-slot (24-bit data left-justified)
-        .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,         // 4
+        // Use stereo (right+left) format while debugging so we can detect
+        // which channel the microphone places its data (some mics use right).
+        .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,       // stereo interleaved
         .communication_format = I2S_COMM_FORMAT_STAND_I2S,   // 1
         .intr_alloc_flags = ESP_INTR_FLAG_LEVEL2,            // (1<<2)
         .dma_buf_count = 3,
@@ -37,9 +39,53 @@ static void I2SSetup(void)
         .data_out_num = I2S_PIN_NO_CHANGE,     // IIS_DSIN
         .data_in_num = MIC_SDOUT               // IIS_DOUT
     };
-    i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL);
-    i2s_set_pin(I2S_PORT, &pin_config);
+
+    // Install driver and check for errors
+    esp_err_t res = i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL);
+    if (res != ESP_OK) {
+        Serial.printf("i2s_driver_install failed: %d\n", res);
+        return;
+    }
+
+    res = i2s_set_pin(I2S_PORT, &pin_config);
+    if (res != ESP_OK) {
+        Serial.printf("i2s_set_pin failed: %d\n", res);
+        return;
+    }
+
+    // Explicitly set the standard clock: sample_rate, bits_per_sample and channels.
+    // This ensures BCLK/WS are configured consistently for the chosen slot width.
+    res = i2s_set_clk(I2S_PORT, i2s_config.sample_rate, i2s_config.bits_per_sample, I2S_CHANNEL_STEREO);
+    if (res != ESP_OK) {
+        Serial.printf("i2s_set_clk failed: %d\n", res);
+        // continue — driver is installed; logging will show if reads are zero.
+    }
+
     i2s_zero_dma_buffer(I2S_PORT);
+
+    // quick self-test: read a small buffer and dump to Serial so we can verify real data
+    {
+        const int test_len = 64;
+        int32_t test_buf[test_len];
+        size_t bytes_read = 0;
+        vTaskDelay(10 / portTICK_PERIOD_MS); // let clocks stabilize
+        esp_err_t r = i2s_read(I2S_PORT, test_buf, sizeof(test_buf), &bytes_read, 100 / portTICK_PERIOD_MS);
+        Serial.printf("I2S self-test read bytes: %u\n", (unsigned)bytes_read);
+        if (r == ESP_OK && bytes_read > 0) {
+            int samples = bytes_read / sizeof(int32_t);
+            int pairs = samples / 2;
+            int dump = pairs < 4 ? pairs : 4;
+            Serial.print("Self-test sample pairs (L,R): ");
+            for (int i = 0; i < dump; ++i) {
+                uint32_t l = (uint32_t)test_buf[i*2];
+                uint32_t r = (uint32_t)test_buf[i*2 + 1];
+                Serial.printf("[%08X,%08X] ", l, r);
+            }
+            Serial.println();
+        } else {
+            Serial.println("Self-test: no data or read failed");
+        }
+    }
 }
 
 
@@ -84,13 +130,16 @@ void handleAudioStream() {
         esp_err_t i2s_read_result = i2s_read(I2S_PORT, (void*) i2s_read_buff, i2s_read_len * sizeof(int32_t), &bytes_read, portMAX_DELAY);
  
         if (i2s_read_result == ESP_OK && bytes_read > 0) {
-            // Log bytes read and a small sample dump for debugging
+            // Log bytes read and a small stereo sample dump (Left,Right pairs)
             Serial.printf("I2S read bytes: %u\n", (unsigned)bytes_read);
             int samples = bytes_read / sizeof(int32_t);
-            int dump = samples < 8 ? samples : 8;
-            Serial.print("Sample hex: ");
+            int pairs = samples / 2;
+            int dump = pairs < 8 ? pairs : 8;
+            Serial.print("Sample pairs (L,R): ");
             for (int i = 0; i < dump; ++i) {
-                Serial.printf("%08X ", (uint32_t)i2s_read_buff[i]);
+                uint32_t left = (uint32_t)i2s_read_buff[i*2];
+                uint32_t right = (uint32_t)i2s_read_buff[i*2 + 1];
+                Serial.printf("[%08X,%08X] ", left, right);
             }
             Serial.println();
  
@@ -110,7 +159,7 @@ void handleAudioStream() {
          }
      }
  }
-
+ 
 void setup() {
     Serial.begin(115200);
     I2SSetup();
