@@ -12,26 +12,25 @@
 // WiFi credentials are provided by include/secrets.h
 #include "secrets.h"
 
-WebServer server(80);  // Set port
+// Convenience redirect
+WebServer server(80);  
+// Raw TCP server for the continuous audio stream (avoids blocking)
+WiFiServer streamServer(8080);
 
-static void I2SSetup(void)
-{
+static void I2SSetup(void) {
     i2s_config_t i2s_config = {
         // For INMP441 microphone
         .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
-        .sample_rate = 44100,
-        // Use 32-bit slot width so MCLK/BCLK/WS remain accurate without
-        // forcing a non-standard MCLK multiple. INMP441 is 24-bit data
-        // left-justified inside a 32-bit slot.
-        .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,        // 32-slot (24-bit data left-justified)
-        // Use stereo (right+left) format while debugging so we can detect
-        // which channel the microphone places its data (some mics use right).
-        .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,       // stereo interleaved
-        .communication_format = I2S_COMM_FORMAT_STAND_I2S,   // 1
-        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL2,            // (1<<2)
-        .dma_buf_count = 3,
-        .dma_buf_len = 300,
-    };
+        // TODO: Drop sample rate for testing; consider turning up later:
+        .sample_rate = 16000,
+         // INMP441 is 24-bit data left-justified inside a 32-bit slot.
+         .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,        // 32-slot (24-bit data left-justified)
+         .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,        // TODO: Collect both channels for debugging
+         .communication_format = I2S_COMM_FORMAT_STAND_I2S,   // 1
+         .intr_alloc_flags = 0,  // Lower interrupt priority to avoid starving WiFi/lwIP tasks
+         .dma_buf_count = 3,
+         .dma_buf_len = 128,
+     };
     i2s_pin_config_t pin_config = {
         .mck_io_num = I2S_PIN_NO_CHANGE,
         .bck_io_num = MIC_SCK,                 // IIS_SCLK
@@ -53,22 +52,21 @@ static void I2SSetup(void)
         return;
     }
 
-    // Explicitly set the standard clock: sample_rate, bits_per_sample and channels.
-    // This ensures BCLK/WS are configured consistently for the chosen slot width.
+    // Explicitly set standard clock
+    // This ensures BCLK/WS are configured consistently
     res = i2s_set_clk(I2S_PORT, i2s_config.sample_rate, i2s_config.bits_per_sample, I2S_CHANNEL_STEREO);
     if (res != ESP_OK) {
         Serial.printf("i2s_set_clk failed: %d\n", res);
-        // continue — driver is installed; logging will show if reads are zero.
+        // continue — driver is installed
     }
-
     i2s_zero_dma_buffer(I2S_PORT);
 
-    // quick self-test: read a small buffer and dump to Serial so we can verify real data
+    // Startup self-test 
     {
         const int test_len = 64;
         int32_t test_buf[test_len];
         size_t bytes_read = 0;
-        vTaskDelay(10 / portTICK_PERIOD_MS); // let clocks stabilize
+        vTaskDelay(1000 / portTICK_PERIOD_MS); // "let clocks stabilize"
         esp_err_t r = i2s_read(I2S_PORT, test_buf, sizeof(test_buf), &bytes_read, 100 / portTICK_PERIOD_MS);
         Serial.printf("I2S self-test read bytes: %u\n", (unsigned)bytes_read);
         if (r == ESP_OK && bytes_read > 0) {
@@ -88,104 +86,115 @@ static void I2SSetup(void)
     }
 }
 
-
-// Function to send the WAV header to the client
-void sendWavHeader() {
-    // 16-bit PCM, mono, 44100 Hz
-    byte header[44] = {
-        0x52, 0x49, 0x46, 0x46, // RIFF
-        0xFF, 0xFF, 0xFF, 0xFF, // File size, placeholder to be replaced
-        0x57, 0x41, 0x56, 0x45, // WAVE
-        0x66, 0x6D, 0x74, 0x20, // fmt 
-        0x10, 0x00, 0x00, 0x00, // Subchunk1Size (16 for PCM)
-        0x01, 0x00,             // AudioFormat (PCM = 1)
-        0x01, 0x00,             // NumChannels (Mono = 1)
-        0x44, 0xAC, 0x00, 0x00, // SampleRate (44100 Hz)
-        0x88, 0x58, 0x01, 0x00, // ByteRate (44100 * 1 * 16/8 = 88200)
-        0x02, 0x00,             // BlockAlign (1 * 16/8 = 2)
-        0x10, 0x00,             // BitsPerSample (16)
-        0x64, 0x61, 0x74, 0x61, // data
-        0xFF, 0xFF, 0xFF, 0xFF  // Subchunk2Size (data size, placeholder to be replaced)
-    };
-    // send raw bytes (may contain NULs) directly to the client socket
-    WiFiClient client = server.client();
-    if (client && client.connected()) {
-        client.write(header, sizeof(header));
-    }
+void handleAudioStream() {
+    // Redirect :80 clients to raw stream server on port 8080.
+    String location = String("http://") + WiFi.localIP().toString() + ":8080/stream";
+    server.sendHeader("Location", location);
+    server.send(302, "text/plain", "Redirecting to stream server");
 }
 
-
-void handleAudioStream() {
-    server.setContentLength(CONTENT_LENGTH_UNKNOWN);
-    server.send(200, "audio/wav", "");
- 
-    sendWavHeader();
- 
-    const int i2s_read_len = 1024;
-    // read into 32-bit words (driver returns 32-bit per slot)
+// Streaming task — runs as a separate per-client FreeRTOS task
+//  Accepts a client, sends a WAV header, then streams
+static void streamingTask(void *pvParameters) {
+    (void)pvParameters;
+    const int i2s_read_len = 256; // "smaller read improves latency"
     int32_t i2s_read_buff[i2s_read_len];
- 
+
+    // TODO: Replace hardcoded WAV header
+    byte wavHeader[44] = {
+        0x52,0x49,0x46,0x46, 0xFF,0xFF,0xFF,0xFF,
+        0x57,0x41,0x56,0x45,
+        0x66,0x6D,0x74,0x20,
+        0x10,0x00,0x00,0x00,
+        0x01,0x00,
+        0x01,0x00,
+        0x40,0x1F,0x00,0x00, // SampleRate (16000) -> 0x00001F40
+        0x00,0x7D,0x00,0x00, // ByteRate (16000 * 1 * 16/8 = 32000 -> 0x00007D00) little-endian
+        0x02,0x00,
+        0x10,0x00,
+        0x64,0x61,0x74,0x61,
+        0xFF,0xFF,0xFF,0xFF
+    };
+
     while (true) {
-        size_t bytes_read = 0;
-        esp_err_t i2s_read_result = i2s_read(I2S_PORT, (void*) i2s_read_buff, i2s_read_len * sizeof(int32_t), &bytes_read, portMAX_DELAY);
- 
-        if (i2s_read_result == ESP_OK && bytes_read > 0) {
-            // Log bytes read and a small stereo sample dump (Left,Right pairs)
-            Serial.printf("I2S read bytes: %u\n", (unsigned)bytes_read);
-            int samples = bytes_read / sizeof(int32_t); // total slot samples
-            int pairs = samples / 2;                    // stereo pairs
-            int dump = pairs < 8 ? pairs : 8;
-            Serial.print("Sample pairs (L,R): ");
-            for (int i = 0; i < dump; ++i) {
-                uint32_t left = (uint32_t)i2s_read_buff[i*2];
-                uint32_t right = (uint32_t)i2s_read_buff[i*2 + 1];
-                Serial.printf("[%08X,%08X] ", left, right);
+        WiFiClient client = streamServer.available();
+        if (!client) {
+            vTaskDelay(50 / portTICK_PERIOD_MS);
+            continue;
+        }
+
+        Serial.printf("Streamer: client connected from %s\n", client.remoteIP().toString().c_str());
+        client.setNoDelay(true);
+
+        // Send HTTP headers + raw WAV header (no Content-Length; keep connection open)
+        // Some players accept this pattern for live streams.
+        client.print("HTTP/1.1 200 OK\r\n");
+        client.print("Content-Type: audio/wav\r\n");
+        client.print("Connection: close\r\n");
+        client.print("\r\n");
+        // send the WAV header bytes directly
+        client.write(wavHeader, sizeof(wavHeader));
+
+        // Stream loop
+        while (client && client.connected()) {
+            size_t bytes_read = 0;
+            // bounded timeout so this task yields occasionally
+            esp_err_t r = i2s_read(I2S_PORT, i2s_read_buff, i2s_read_len * sizeof(int32_t), &bytes_read, 100 / portTICK_PERIOD_MS);
+            if (r != ESP_OK || bytes_read == 0) {
+                // no data this cycle; let other tasks run
+                vTaskDelay(5 / portTICK_PERIOD_MS);
+                continue;
             }
-            Serial.println();
- 
-            // Convert stereo 32-bit (left-justified 24-in-32) -> mono 16-bit (left channel)
-            int out_count = pairs; // one mono sample per pair
-            // allocate on stack if size reasonable; otherwise use a static buffer or malloc
-            int16_t outbuf[512]; // ensure large enough for i2s_read_len=1024 -> pairs=512
-            if (out_count > (int)(sizeof(outbuf)/sizeof(outbuf[0]))) {
-                out_count = (int)(sizeof(outbuf)/sizeof(outbuf[0])); // clamp to buffer
-            }
+
+            // Convert interleaved stereo 32-bit -> mono 16-bit (left channel)
+            int samples = bytes_read / sizeof(int32_t);
+            int pairs = samples / 2;
+            if (pairs <= 0) continue;
+
+            // Allocate small temp buffer on stack (pairs <= 128 here)
+            int16_t outbuf[128];
+            int out_count = pairs;
+            if (out_count > (int)(sizeof(outbuf)/sizeof(outbuf[0]))) out_count = (int)(sizeof(outbuf)/sizeof(outbuf[0]));
+
             for (int i = 0; i < out_count; ++i) {
                 int32_t left = i2s_read_buff[i*2];
-                // INMP441 provides 24-bit left-justified in 32 bits; shift right 8 to get 16-bit
                 int16_t s16 = (int16_t)(left >> 8);
                 outbuf[i] = s16;
             }
             size_t bytes_to_send = out_count * sizeof(int16_t);
- 
-            // debug dump first few 16-bit samples
-            Serial.print("Output 16-bit samples: ");
-            int dump16 = out_count < 8 ? out_count : 8;
-            for (int i = 0; i < dump16; ++i) {
-                Serial.printf("%04X ", (uint16_t)outbuf[i]);
-            }
-            Serial.println();
- 
-            // send converted 16-bit mono audio bytes to client socket
-            WiFiClient client = server.client();
-            if (client && client.connected()) {
-                size_t written = 0;
-                const uint8_t* src = (const uint8_t*)outbuf;
-                while (written < bytes_to_send) {
-                    int w = client.write(src + written, bytes_to_send - written);
-                    if (w <= 0) break;
-                    written += w;
+
+            // send in small chunks, yield if socket buffer full
+            const uint8_t* src = (const uint8_t*)outbuf;
+            size_t sent = 0;
+            unsigned long deadline = millis() + 200;
+            while (sent < bytes_to_send && client && client.connected()) {
+                int canWrite = client.availableForWrite();
+                if (canWrite <= 0) {
+                    // let stacks run
+                    vTaskDelay(1 / portTICK_PERIOD_MS);
+                    if (millis() > deadline) break;
+                    continue;
                 }
+                size_t chunk = (size_t)canWrite;
+                if (chunk > bytes_to_send - sent) chunk = bytes_to_send - sent;
+                int w = client.write(src + sent, chunk);
+                if (w <= 0) break;
+                sent += (size_t)w;
             }
-         }
- 
-         if (!server.client().connected()) {
-             Serial.println("Client Disconnected");
-             break;
-         }
-     }
- }
- 
+
+            // small yield to allow WiFi and other tasks to run
+            taskYIELD();
+        }
+
+        if (client) {
+            client.stop();
+        }
+        Serial.println("Streamer: client disconnected");
+        // brief pause before accepting next client
+        vTaskDelay(100 / portTICK_PERIOD_MS);
+    }
+}
+
 // Helper: map WiFi.status() to readable text
 static const char* wifiStatusStr(wl_status_t s) {
     switch (s) {
@@ -236,7 +245,7 @@ void setup() {
     }
 
     const int max_retries = 300;
-    const unsigned long connect_timeout_ms = 180UL * 1000UL; // 180 seconds per attempt
+    const unsigned long connect_timeout_ms = 180UL * 1000UL; // TODO: 180 seconds per attempt while debugging
     bool connected = false;
 
     for (int attempt = 1; attempt <= max_retries && !connected; ++attempt) {
@@ -273,11 +282,21 @@ void setup() {
         Serial.println("Giving up connecting to WiFi. Check SSID/password, visibility, and AP signal.");
     }
 
-    // Register HTTP handler and start server
+    // Register HTTP handler (redirect)
     server.on("/stream", HTTP_GET, handleAudioStream);
     server.begin();
+
+    // Start the raw stream server
+    streamServer.begin();
+    Serial.println("Stream server listening on port 8080");
+    xTaskCreatePinnedToCore(streamingTask, "streamingTask", 8192, NULL, 1, NULL, 1);
 }
 
 void loop() {
-    // All work is done in the audio stream handler
+    // Call handleClient() so WebServer processes incoming HTTP requests
+    // Without this the server won't respond.
+    server.handleClient();
+
+    // small delay/yield
+    delay(1);
 }
