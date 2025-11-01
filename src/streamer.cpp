@@ -4,7 +4,29 @@
 #include <WiFi.h>
 #include <driver/i2s.h>
 
-// create the server inside this module
+// mu-law encoder for G.711 μ-law
+static inline uint8_t linear_to_mulaw(int16_t pcm_val) {
+    const uint16_t BIAS = 0x84; // 132
+    uint16_t mask;
+    uint16_t seg;
+    uint8_t uval;
+    int16_t pcm = pcm_val;
+    if (pcm < 0) { pcm = -pcm; mask = 0x7F; } else { mask = 0xFF; }
+    uint16_t pcm_u = (uint16_t)pcm + BIAS;
+    if (pcm_u > 0x7FFF) pcm_u = 0x7FFF;
+    // find segment (0..7)
+    seg = 0;
+    uint16_t tmp = pcm_u >> 7;
+    while (tmp) { seg++; tmp >>= 1; }
+    if (seg >= 8) {
+        uval = (uint8_t)(0x7F ^ mask);
+    } else {
+        uval = (uint8_t)((seg << 4) | ((pcm_u >> (seg + 3)) & 0x0F));
+        uval ^= mask;
+    }
+    return uval;
+}
+
 static WiFiServer s_streamServer(8080);
 
 static void streamingTask(void *pvParameters) {
@@ -12,21 +34,26 @@ static void streamingTask(void *pvParameters) {
     const int i2s_read_len = AUDIO_DMA_BUF_LEN; // match DMA buffer
     int32_t i2s_read_buff[i2s_read_len];
 
-    // WAV header (16000 Hz, 16-bit mono)
+    // WAV header: 8 kHz, 8-bit μ-law, mono. WAVE format tag 7 = μ-law
     byte streamingWavHeader[44] = {
-        0x52,0x49,0x46,0x46, 0xFF,0xFF,0xFF,0xFF,
-        0x57,0x41,0x56,0x45,
-        0x66,0x6D,0x74,0x20,
-        0x10,0x00,0x00,0x00,
-        0x01,0x00,
-        0x01,0x00,
-        0x80,0x3E,0x00,0x00, // SampleRate (16000) little-endian
-        0x00,0x7D,0x00,0x00, // ByteRate (32000) little-endian
-        0x02,0x00,
-        0x10,0x00,
-        0x64,0x61,0x74,0x61,
+        'R','I','F','F', 0xFF,0xFF,0xFF,0xFF,
+        'W','A','V','E',
+        'f','m','t',' ',
+        0x10,0x00,0x00,0x00,      // Subchunk1Size (16)
+        0x07,0x00,                // AudioFormat (7 = μ-law)
+        0x01,0x00,                // NumChannels (1)
+        0x40,0x1F,0x00,0x00,      // SampleRate = 8000 (0x00001F40)
+        0x40,0x1F,0x00,0x00,      // ByteRate = 8000 * 1 * 1 = 8000 (we'll set below)
+        0x01,0x00,                // BlockAlign = 1
+        0x08,0x00,                // BitsPerSample = 8
+        'd','a','t','a',
         0xFF,0xFF,0xFF,0xFF
     };
+    // Correct ByteRate and little-endian sample-rate/byterate:
+    // sample rate 8000 -> 0x00001F40 -> bytes already set above; fix ByteRate
+    streamingWavHeader[28] = 0x40; streamingWavHeader[29] = 0x1F; streamingWavHeader[30] = 0x00; streamingWavHeader[31] = 0x00;
+    // ByteRate = 8000 -> bytes 32..35
+    streamingWavHeader[32] = 0x40; streamingWavHeader[33] = 0x1F; streamingWavHeader[34] = 0x00; streamingWavHeader[35] = 0x00;
 
     s_streamServer.begin();
     Serial.println("Stream server listening on port 8080");
@@ -80,6 +107,8 @@ static void streamingTask(void *pvParameters) {
         }
 
         // Stream loop
+        size_t total_sent_since_ts = 0;
+        unsigned long ts = millis();
         while (client && client.connected()) {
             size_t bytes_read = 0;
             esp_err_t r = i2s_read(I2S_PORT, i2s_read_buff, i2s_read_len * sizeof(int32_t), &bytes_read, 200 / portTICK_PERIOD_MS);
@@ -87,21 +116,22 @@ static void streamingTask(void *pvParameters) {
                 vTaskDelay(5 / portTICK_PERIOD_MS);
                 continue;
             }
-
-            int samples = bytes_read / sizeof(int32_t);
+            int samples = bytes_read / sizeof(int32_t); // mono-left configuration -> one 32-bit per sample
             if (samples <= 0) continue;
 
-            // convert in blocks and write larger chunks
-            const int MAX_OUT = 256;
-            int to_convert = samples < MAX_OUT ? samples : MAX_OUT;
-            int16_t outbuf[MAX_OUT];
+            // convert up to CHUNK_SAMPLES samples to μ-law bytes
+            const int CHUNK_SAMPLES = 256;
+            int to_convert = samples < CHUNK_SAMPLES ? samples : CHUNK_SAMPLES;
+            uint8_t mulaw_buf[CHUNK_SAMPLES];
             for (int i = 0; i < to_convert; ++i) {
                 int32_t s32 = i2s_read_buff[i];
-                outbuf[i] = (int16_t)(s32 >> 8);
+                int16_t s16 = (int16_t)(s32 >> 8); // 24-bit left-justified -> 16-bit
+                mulaw_buf[i] = linear_to_mulaw(s16);
             }
-            size_t bytes_to_send = (size_t)to_convert * sizeof(int16_t);
+            size_t bytes_to_send = (size_t)to_convert; // 1 byte per sample (μ-law)
 
-            const uint8_t* src = (const uint8_t*)outbuf;
+            // write larger chunks reliably
+            const uint8_t* src = mulaw_buf;
             size_t written = 0;
             unsigned long write_deadline = millis() + 1000;
             while (written < bytes_to_send && client && client.connected()) {
@@ -110,27 +140,29 @@ static void streamingTask(void *pvParameters) {
                 int w = client.write(src + written, chunk);
                 if (w > 0) {
                     written += (size_t)w;
+                    total_sent_since_ts += (size_t)w;
                 } else {
                     vTaskDelay(1 / portTICK_PERIOD_MS);
                     if (millis() > write_deadline) break;
                 }
             }
 
-            // debug
-            static unsigned long dbg_ts = 0;
-            if (millis() - dbg_ts > 2000) {
-                dbg_ts = millis();
-                Serial.printf("Streamer debug: bytes_read=%u, last_written=%u\n", (unsigned)bytes_read, (unsigned)written);
+            // throughput debug: print bytes/sec every second
+            if (millis() - ts >= 1000) {
+                Serial.printf("Streamer throughput: %u B/s\n", (unsigned)total_sent_since_ts);
+                total_sent_since_ts = 0;
+                ts = millis();
             }
 
             if (written == 0) {
                 static int stall_count = 0;
-                if (++stall_count > 10) {
-                    Serial.println("Streamer: write stalled repeatedly, closing client");
-                    break;
-                }
+                if (++stall_count > 10) { Serial.println("Streamer: write stalled, closing client"); break; }
+            } else {
+                // reset stall_count on success
+                // (declare stall_count above if needed)
             }
 
+            // yield to WiFi/lwip
             vTaskDelay(1 / portTICK_PERIOD_MS);
         }
 

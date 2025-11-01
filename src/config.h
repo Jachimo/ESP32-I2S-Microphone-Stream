@@ -8,7 +8,8 @@
 #define MIC_SDOUT 32
 #define I2S_PORT  I2S_NUM_0
 
-#define AUDIO_SAMPLE_RATE 16000
+// Use 8 kHz narrowband (telephone)
+#define AUDIO_SAMPLE_RATE 8000
 #define AUDIO_BITS_PER_SAMPLE I2S_BITS_PER_SAMPLE_32BIT
 #define AUDIO_DMA_BUF_COUNT 3
 #define AUDIO_DMA_BUF_LEN 128
