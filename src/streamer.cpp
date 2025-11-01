@@ -96,16 +96,6 @@ static void streamingTask(void *pvParameters) {
         client.flush();
         Serial.println("Streamer: response headers & WAV header sent, entering stream loop");
 
-        // small immediate test pattern to verify wire
-        {
-            const int TEST_SAMPLES = 64;
-            int16_t testbuf[TEST_SAMPLES];
-            for (int i = 0; i < TEST_SAMPLES; ++i) testbuf[i] = (int16_t)((i & 0xff) - 128) * 64;
-            client.write((const uint8_t*)testbuf, TEST_SAMPLES * sizeof(int16_t));
-            client.flush();
-            Serial.printf("Streamer: test pattern sent (%u bytes)\n", (unsigned)(TEST_SAMPLES * sizeof(int16_t)));
-        }
-
         // Stream loop
         size_t total_sent_since_ts = 0;
         unsigned long ts = millis();
