@@ -97,19 +97,21 @@ void handleAudioStream() {
 //  Accepts a client, sends a WAV header, then streams
 static void streamingTask(void *pvParameters) {
     (void)pvParameters;
-    const int i2s_read_len = 256; // "smaller read improves latency"
+
+    // match DMA buffer size and reduce latency
+    const int i2s_read_len = 128;
     int32_t i2s_read_buff[i2s_read_len];
 
-    // TODO: Replace hardcoded WAV header
-    byte wavHeader[44] = {
+    // WAV header used earlier (16000 Hz, 16-bit mono)
+    byte streamingWavHeader[44] = {
         0x52,0x49,0x46,0x46, 0xFF,0xFF,0xFF,0xFF,
         0x57,0x41,0x56,0x45,
         0x66,0x6D,0x74,0x20,
         0x10,0x00,0x00,0x00,
         0x01,0x00,
         0x01,0x00,
-        0x40,0x1F,0x00,0x00, // SampleRate (16000) -> 0x00001F40
-        0x00,0x7D,0x00,0x00, // ByteRate (16000 * 1 * 16/8 = 32000 -> 0x00007D00) little-endian
+        0x80,0x3E,0x00,0x00, // SampleRate (16000) little-endian
+        0x00,0x7D,0x00,0x00, // ByteRate (32000) little-endian
         0x02,0x00,
         0x10,0x00,
         0x64,0x61,0x74,0x61,
@@ -126,135 +128,106 @@ static void streamingTask(void *pvParameters) {
         Serial.printf("Streamer: client connected from %s\n", client.remoteIP().toString().c_str());
         client.setNoDelay(true);
 
-        // TODO: Potential VLC behavior workaround — read request headers
-        // Wait briefly for request data to arrive (avoid infinite block)
-        unsigned long wait_deadline = millis() + 200;
-        while (!client.available() && millis() < wait_deadline && client.connected()) {
-            vTaskDelay(1 / portTICK_PERIOD_MS);
-        }
-
-        // --- Robustly read and discard the client's HTTP request headers ---
-        unsigned long total_deadline = millis() + 1000; // wait up to 1s for headers
-        String requestLine;
+        // Read and discard request headers (robust)
+        unsigned long total_deadline = millis() + 1000;
         bool firstLineLogged = false;
         bool headers_done = false;
         while (client.connected() && millis() < total_deadline && !headers_done) {
             while (client.available()) {
-                String line = client.readStringUntil('\n'); // reads up to '\n'
-                // trim trailing CR for easier checks
+                String line = client.readStringUntil('\n');
                 if (line.endsWith("\r")) line.remove(line.length() - 1);
                 if (!firstLineLogged) {
-                    requestLine = line;
-                    Serial.printf("Streamer: request first line: %s\n", requestLine.c_str());
+                    Serial.printf("Streamer: request first line: %s\n", line.c_str());
                     firstLineLogged = true;
                 }
-                // end of headers: blank line
-                if (line.length() == 0) {
-                    headers_done = true;
-                    break;
-                }
-                // continue reading remaining header lines
+                if (line.length() == 0) { headers_done = true; break; }
             }
             if (!headers_done) vTaskDelay(5 / portTICK_PERIOD_MS);
         }
-        if (!firstLineLogged) {
-            Serial.println("Streamer: no request headers received (timeout), proceeding to respond");
-        } else if (!headers_done) {
-            Serial.println("Streamer: header read timed out but proceeding to respond");
-        }
+        if (!firstLineLogged) Serial.println("Streamer: no request headers received (timeout), proceeding to respond");
 
-        // Send HTTP headers + raw WAV header (no Content-Length; keep connection open)
+        // Send response headers + WAV header
         client.print("HTTP/1.1 200 OK\r\n");
         client.print("Content-Type: audio/wav\r\n");
         client.print("Cache-Control: no-cache\r\n");
         client.print("Connection: keep-alive\r\n");
         client.print("\r\n");
-        
-        // WAV header: sample rate = 16000 (0x00003E80 -> bytes 0x80,0x3E,0x00,0x00)
-        byte streamingWavHeader[44] = {
-            0x52,0x49,0x46,0x46, 0xFF,0xFF,0xFF,0xFF,
-            0x57,0x41,0x56,0x45,
-            0x66,0x6D,0x74,0x20,
-            0x10,0x00,0x00,0x00,
-            0x01,0x00,
-            0x01,0x00,
-            0x80,0x3E,0x00,0x00, // SampleRate (16000) little-endian
-            0x00,0x7D,0x00,0x00, // ByteRate (32000) little-endian
-            0x02,0x00,
-            0x10,0x00,
-            0x64,0x61,0x74,0x61,
-            0xFF,0xFF,0xFF,0xFF
-        };
         client.write(streamingWavHeader, sizeof(streamingWavHeader));
-         // Ensure header bytes are flushed to client
-         client.flush();
-         Serial.println("Streamer: response headers & WAV header sent, entering stream loop");
- 
-         // Stream loop
-         while (client && client.connected()) {
+        client.flush();
+        Serial.println("Streamer: response headers & WAV header sent, entering stream loop");
+
+        // Stream loop: convert 32-bit stereo -> 16-bit mono (left), send in small chunks
+        bool firstAudioSent = false;
+        int consecutiveEmptySends = 0;
+
+        while (true) {
+            if (!client || !client.connected()) break;
+
             size_t bytes_read = 0;
-            // bounded timeout so this task yields occasionally
-            esp_err_t r = i2s_read(I2S_PORT, i2s_read_buff, i2s_read_len * sizeof(int32_t), &bytes_read, 100 / portTICK_PERIOD_MS);
+            esp_err_t r = i2s_read(I2S_PORT, i2s_read_buff, i2s_read_len * sizeof(int32_t), &bytes_read, 200 / portTICK_PERIOD_MS);
+            
             if (r != ESP_OK || bytes_read == 0) {
-                // no data this cycle; let other tasks run
+                // no data this cycle; allow other tasks to run
                 vTaskDelay(5 / portTICK_PERIOD_MS);
                 continue;
             }
 
-            // Convert interleaved stereo 32-bit -> mono 16-bit (left channel)
+            // convert
             int samples = bytes_read / sizeof(int32_t);
             int pairs = samples / 2;
             if (pairs <= 0) continue;
 
-            // Allocate small temp buffer on stack (pairs <= 128 here)
-            int16_t outbuf[128];
-            int out_count = pairs;
-
-            // TODO: Simplify this abomination 
-            if (out_count > (int)(sizeof(outbuf)/sizeof(outbuf[0]))) out_count = (int)(sizeof(outbuf)/sizeof(outbuf[0]));
-
-            for (int i = 0; i < out_count; ++i) {
-                int32_t left = i2s_read_buff[i*2];
-                int16_t s16 = (int16_t)(left >> 8);
-                outbuf[i] = s16;
+            const int MAX_OUT = 64; // 64 samples -> 128 bytes per chunk
+            int16_t outbuf[MAX_OUT];
+            int to_convert = pairs < MAX_OUT ? pairs : MAX_OUT;
+            for (int i = 0; i < to_convert; ++i) {
+                int32_t left = i2s_read_buff[i * 2];
+                outbuf[i] = (int16_t)(left >> 8);
             }
-            size_t bytes_to_send = out_count * sizeof(int16_t);
+            size_t bytes_to_send = (size_t)to_convert * sizeof(int16_t);
 
-            // send in small chunks, yield if socket buffer full
+            // write small fixed-size chunks reliably (do NOT rely solely on availableForWrite)
             const uint8_t* src = (const uint8_t*)outbuf;
-            size_t sent = 0;
-            unsigned long deadline = millis() + 200;
-            while (sent < bytes_to_send && client && client.connected()) {
-                int canWrite = client.availableForWrite();
-                if (canWrite <= 0) {
-                    // let stacks run
-                    vTaskDelay(1 / portTICK_PERIOD_MS);
-                    if (millis() > deadline) break;
-                    continue;
+            size_t written = 0;
+            unsigned long write_deadline = millis() + 1000; // allow up to 1s to write this chunk
+            while (written < bytes_to_send && client && client.connected()) {
+                size_t chunk = bytes_to_send - written;
+                if (chunk > 64) chunk = 64; // write <=64 bytes per attempt
+                int w = client.write(src + written, chunk);
+                if (w > 0) {
+                    written += (size_t)w;
+                } else {
+                    // no progress; yield and retry until deadline
+                    vTaskDelay(2 / portTICK_PERIOD_MS);
+                    if (millis() > write_deadline) break;
                 }
-                size_t chunk = (size_t)canWrite;
-                if (chunk > bytes_to_send - sent) chunk = bytes_to_send - sent;
-                int w = client.write(src + sent, chunk);
-                if (w <= 0) break;
-                sent += (size_t)w;
             }
 
-            // TODO: Debugging
-            static bool firstAudioSent = false;
-            if (!firstAudioSent && sent > 0) {
-                Serial.printf("Streamer: first audio block sent (%u bytes)\n", (unsigned)sent);
-                firstAudioSent = true;
+            if (written > 0) {
+                consecutiveEmptySends = 0;
+                if (!firstAudioSent) {
+                    Serial.printf("Streamer: first audio block sent (%u bytes)\n", (unsigned)written);
+                    firstAudioSent = true;
+                }
+            } else {
+                consecutiveEmptySends++;
+                // If we repeatedly can't write, break the client to allow reconnect
+                if (consecutiveEmptySends >= 10) {
+                    Serial.println("Streamer: unable to write audio for multiple attempts — closing client");
+                    break;
+                }
             }
-             // yield to allow WiFi and other tasks to run
-             taskYIELD();
-         }
 
-        if (client) {
-            client.stop();
+            // occasional debug: show bytes_read / written
+            static unsigned long dbg_ts = 0;
+            if (millis() - dbg_ts > 2000) {
+                dbg_ts = millis();
+                Serial.printf("Streamer debug: bytes_read=%u, last_written=%u\n", (unsigned)bytes_read, (unsigned)written);
+            }
+
+            // give WiFi stack a chance
+            vTaskDelay(1 / portTICK_PERIOD_MS);
         }
-        Serial.println("Streamer: client disconnected");
-        // brief pause before accepting next client
-        vTaskDelay(100 / portTICK_PERIOD_MS);
     }
 }
 
