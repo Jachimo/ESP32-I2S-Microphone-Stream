@@ -199,7 +199,7 @@ static void streamingTask(void *pvParameters) {
             int pairs = samples / 2;
             if (pairs <= 0) continue;
 
-            const int MAX_OUT = 64; // 64 samples -> 128 bytes per chunk
+            const int MAX_OUT = 256; // increase output chunk (samples) -> larger TCP payload
             int16_t outbuf[MAX_OUT];
             int to_convert = pairs < MAX_OUT ? pairs : MAX_OUT;
             for (int i = 0; i < to_convert; ++i) {
@@ -208,22 +208,24 @@ static void streamingTask(void *pvParameters) {
             }
             size_t bytes_to_send = (size_t)to_convert * sizeof(int16_t);
 
-            // write small fixed-size chunks reliably (do NOT rely solely on availableForWrite)
+            // write larger chunks reliably (avoid tiny 64-byte writes)
             const uint8_t* src = (const uint8_t*)outbuf;
             size_t written = 0;
             unsigned long write_deadline = millis() + 1000; // allow up to 1s to write this chunk
             while (written < bytes_to_send && client && client.connected()) {
                 size_t chunk = bytes_to_send - written;
-                if (chunk > 64) chunk = 64; // write <=64 bytes per attempt
+                if (chunk > 1024) chunk = 1024; // send up to 1KB per attempt
                 int w = client.write(src + written, chunk);
                 if (w > 0) {
                     written += (size_t)w;
                 } else {
-                    // no progress; yield and retry until deadline
-                    vTaskDelay(2 / portTICK_PERIOD_MS);
+                    // avoid busy-looping, let other tasks run briefly
+                    vTaskDelay(1 / portTICK_PERIOD_MS);
                     if (millis() > write_deadline) break;
                 }
             }
+            // reduce forced sleeps — yield to WiFi stack instead of long delays
+            taskYIELD();
 
             if (written > 0) {
                 consecutiveEmptySends = 0;
