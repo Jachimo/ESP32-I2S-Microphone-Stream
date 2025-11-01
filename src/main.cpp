@@ -2,6 +2,7 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <driver/i2s.h>
+#include "esp_wifi.h"  // to tune PHY / power-save
 
 // Pin assignments for Heltec WiFi Kit 32 (Demo Board w/ LEDs and Buzzer)
 #define MIC_SCK   33   // Position 15J
@@ -12,8 +13,6 @@
 // WiFi credentials are provided by include/secrets.h
 #include "secrets.h"
 
-// Convenience redirect
-WebServer server(80);  
 // Raw TCP server for the continuous audio stream (avoids blocking)
 WiFiServer streamServer(8080);
 
@@ -23,7 +22,6 @@ static void I2SSetup(void) {
         .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
         // TODO: Drop sample rate for testing; consider turning up later:
         .sample_rate = 16000,
-         // INMP441 is 24-bit data left-justified inside a 32-bit slot.
          .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,        // 32-slot (24-bit data left-justified)
          .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,        // TODO: Collect both channels for debugging
          .communication_format = I2S_COMM_FORMAT_STAND_I2S,   // 1
@@ -84,13 +82,6 @@ static void I2SSetup(void) {
             Serial.println("Self-test: no data or read failed");
         }
     }
-}
-
-void handleAudioStream() {
-    // Redirect :80 clients to raw stream server on port 8080.
-    String location = String("http://") + WiFi.localIP().toString() + ":8080/stream";
-    server.sendHeader("Location", location);
-    server.send(302, "text/plain", "Redirecting to stream server");
 }
 
 // Streaming task — runs as a separate per-client FreeRTOS task
@@ -352,26 +343,44 @@ void setup() {
         Serial.printf("Gateway: %s\n", WiFi.gatewayIP().toString().c_str());
         Serial.printf("Subnet: %s\n", WiFi.subnetMask().toString().c_str());
         Serial.printf("RSSI: %d dBm\n", WiFi.RSSI());
+
+        // Improve link performance: disable WiFi power-save and enable common PHYs.
+        esp_err_t err;
+
+        // Disable WiFi power save (modem sleep)
+        err = esp_wifi_set_ps(WIFI_PS_NONE);
+        Serial.printf("esp_wifi_set_ps(WIFI_PS_NONE) -> %d\n", (int)err);
+
+        // Also tell Arduino wrapper to disable sleep (best-effort)
+        WiFi.setSleep(false);
+
+        // Enable 11b/11g/11n protocols explicitly so HT is available
+        err = esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
+        Serial.printf("esp_wifi_set_protocol(STA, 11B|11G|11N) -> %d\n", (int)err);
+
+        // Print AP info (channel, RSSI, auth) to help debug PHY negotiation
+        wifi_ap_record_t apinfo;
+        if (esp_wifi_sta_get_ap_info(&apinfo) == ESP_OK) {
+            Serial.printf("AP info: SSID=%s, primary_chan=%d, rssi=%d, authmode=%d\n",
+                apinfo.ssid, apinfo.primary, apinfo.rssi, apinfo.authmode);
+        } else {
+            Serial.println("esp_wifi_sta_get_ap_info() failed");
+        }
+
+        // If all else fails, raise tx power:
+        //esp_wifi_set_max_tx_power(78);  // 78 = ~19.5dBm
     } else {
-        Serial.printf("Final WiFi status after retries: %s (0x%02X)\n", wifiStatusStr(WiFi.status()), (int)WiFi.status());
-        Serial.println("Giving up connecting to WiFi. Check SSID/password, visibility, and AP signal.");
-    }
+         Serial.printf("Final WiFi status after retries: %s (0x%02X)\n", wifiStatusStr(WiFi.status()), (int)WiFi.status());
+         Serial.println("Giving up connecting to WiFi. Check SSID/password, visibility, and AP signal.");
+     }
 
-    // Register HTTP handler (redirect)
-    server.on("/stream", HTTP_GET, handleAudioStream);
-    server.begin();
-
-    // Start the raw stream server
+    // Start the raw stream server on :8080
     streamServer.begin();
     Serial.println("Stream server listening on port 8080");
     xTaskCreatePinnedToCore(streamingTask, "streamingTask", 8192, NULL, 1, NULL, 1);
 }
 
 void loop() {
-    // Call handleClient() so WebServer processes incoming HTTP requests
-    // Without this the server won't respond.
-    server.handleClient();
-
     // small delay/yield
     delay(1);
 }
