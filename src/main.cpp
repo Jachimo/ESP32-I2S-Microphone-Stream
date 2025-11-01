@@ -22,13 +22,15 @@ static void I2SSetup(void) {
         .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
         // TODO: Drop sample rate for testing; consider turning up later:
         .sample_rate = 16000,
-         .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,        // 32-slot (24-bit data left-justified)
-         .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,        // TODO: Collect both channels for debugging
+        .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,        // 32-slot (24-bit data left-justified)
+        // Configure driver to provide only the left channel. This avoids reading
+        // interleaved stereo and then selecting the left samples later.
+        .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
          .communication_format = I2S_COMM_FORMAT_STAND_I2S,   // 1
          .intr_alloc_flags = 0,  // Lower interrupt priority to avoid starving WiFi/lwIP tasks
          .dma_buf_count = 3,
          .dma_buf_len = 128,
-     };
+    };
     i2s_pin_config_t pin_config = {
         .mck_io_num = I2S_PIN_NO_CHANGE,
         .bck_io_num = MIC_SCK,                 // IIS_SCLK
@@ -50,9 +52,9 @@ static void I2SSetup(void) {
         return;
     }
 
-    // Explicitly set standard clock
-    // This ensures BCLK/WS are configured consistently
-    res = i2s_set_clk(I2S_PORT, i2s_config.sample_rate, i2s_config.bits_per_sample, I2S_CHANNEL_STEREO);
+    // Set standard clock for mono operation (left channel only)
+    // This ensures BCLK/WS are configured consistently for mono slot usage.
+    res = i2s_set_clk(I2S_PORT, i2s_config.sample_rate, i2s_config.bits_per_sample, I2S_CHANNEL_MONO);
     if (res != ESP_OK) {
         Serial.printf("i2s_set_clk failed: %d\n", res);
         // continue — driver is installed
@@ -69,13 +71,11 @@ static void I2SSetup(void) {
         Serial.printf("I2S self-test read bytes: %u\n", (unsigned)bytes_read);
         if (r == ESP_OK && bytes_read > 0) {
             int samples = bytes_read / sizeof(int32_t);
-            int pairs = samples / 2;
-            int dump = pairs < 4 ? pairs : 4;
-            Serial.print("Self-test sample pairs (L,R): ");
+            int dump = samples < 8 ? samples : 8;
+            Serial.print("Self-test samples (left only): ");
             for (int i = 0; i < dump; ++i) {
-                uint32_t l = (uint32_t)test_buf[i*2];
-                uint32_t r = (uint32_t)test_buf[i*2 + 1];
-                Serial.printf("[%08X,%08X] ", l, r);
+                uint32_t v = (uint32_t)test_buf[i];
+                Serial.printf("%08X ", v);
             }
             Serial.println();
         } else {
@@ -85,7 +85,6 @@ static void I2SSetup(void) {
 }
 
 // Streaming task — runs as a separate per-client FreeRTOS task
-//  Accepts a client, sends a WAV header, then streams
 static void streamingTask(void *pvParameters) {
     (void)pvParameters;
 
@@ -93,7 +92,7 @@ static void streamingTask(void *pvParameters) {
     const int i2s_read_len = 128;
     int32_t i2s_read_buff[i2s_read_len];
 
-    // WAV header used earlier (16000 Hz, 16-bit mono)
+    // WAV header (16kHz, 16-bit mono)
     byte streamingWavHeader[44] = {
         0x52,0x49,0x46,0x46, 0xFF,0xFF,0xFF,0xFF,
         0x57,0x41,0x56,0x45,
@@ -147,37 +146,6 @@ static void streamingTask(void *pvParameters) {
         client.flush();
         Serial.println("Streamer: response headers & WAV header sent, entering stream loop");
 
-        // TODO: REMOVE ME LATER
-        // Immediate sanity-test: send a short known non-zero PCM block
-        {
-            const int TEST_SAMPLES = 128;
-            int16_t testbuf[TEST_SAMPLES];
-
-            // simple ramp / DC-like pattern: non-zero values that are easy to spot
-            for (int i = 0; i < TEST_SAMPLES; ++i) {
-                testbuf[i] = (int16_t)((i & 0xFF) - 128) * 64;
-            }
-
-            const uint8_t* tsrc = (const uint8_t*)testbuf;
-            size_t tbytes = TEST_SAMPLES * sizeof(int16_t);
-            size_t twritten = 0;
-            unsigned long tdeadline = millis() + 1000;
-            while (twritten < tbytes && client && client.connected()) {
-                size_t chunk = tbytes - twritten;
-                if (chunk > 64) chunk = 64;
-                int w = client.write(tsrc + twritten, chunk);
-                if (w > 0) {
-                    twritten += (size_t)w;
-                } else {
-                    vTaskDelay(2 / portTICK_PERIOD_MS);
-                    if (millis() > tdeadline) break;
-                }
-            }
-            client.flush();
-            Serial.printf("Streamer: test pattern sent (%u/%u bytes)\n", (unsigned)twritten, (unsigned)tbytes);
-        }
-        // End sanity-test block
-
         // Stream loop: convert 32-bit stereo -> 16-bit mono (left), send in small chunks
         bool firstAudioSent = false;
         int consecutiveEmptySends = 0;
@@ -194,21 +162,23 @@ static void streamingTask(void *pvParameters) {
                 continue;
             }
 
-            // convert
+            // For mono-left configuration the driver returns one 32-bit slot per sample.
+            // convert mono 32-bit slot -> 16-bit PCM
             int samples = bytes_read / sizeof(int32_t);
-            int pairs = samples / 2;
-            if (pairs <= 0) continue;
+            if (samples <= 0) continue;
 
-            const int MAX_OUT = 256; // increase output chunk (samples) -> larger TCP payload
+            const int MAX_OUT = 256; // number of samples per output chunk
             int16_t outbuf[MAX_OUT];
-            int to_convert = pairs < MAX_OUT ? pairs : MAX_OUT;
+
+            int to_convert = samples < MAX_OUT ? samples : MAX_OUT;
+
             for (int i = 0; i < to_convert; ++i) {
-                int32_t left = i2s_read_buff[i * 2];
-                outbuf[i] = (int16_t)(left >> 8);
+                int32_t s32 = i2s_read_buff[i];
+                // Assuming INMP441 provides 24-bit left-justified in 32-bit slot (?), shift R 8 to get 16-bit
+                outbuf[i] = (int16_t)(s32 >> 8);
             }
             size_t bytes_to_send = (size_t)to_convert * sizeof(int16_t);
 
-            // write larger chunks reliably (avoid tiny 64-byte writes)
             const uint8_t* src = (const uint8_t*)outbuf;
             size_t written = 0;
             unsigned long write_deadline = millis() + 1000; // allow up to 1s to write this chunk
