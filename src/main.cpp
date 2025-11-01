@@ -156,6 +156,37 @@ static void streamingTask(void *pvParameters) {
         client.flush();
         Serial.println("Streamer: response headers & WAV header sent, entering stream loop");
 
+        // TODO: REMOVE ME LATER
+        // Immediate sanity-test: send a short known non-zero PCM block
+        {
+            const int TEST_SAMPLES = 128;
+            int16_t testbuf[TEST_SAMPLES];
+
+            // simple ramp / DC-like pattern: non-zero values that are easy to spot
+            for (int i = 0; i < TEST_SAMPLES; ++i) {
+                testbuf[i] = (int16_t)((i & 0xFF) - 128) * 64;
+            }
+
+            const uint8_t* tsrc = (const uint8_t*)testbuf;
+            size_t tbytes = TEST_SAMPLES * sizeof(int16_t);
+            size_t twritten = 0;
+            unsigned long tdeadline = millis() + 1000;
+            while (twritten < tbytes && client && client.connected()) {
+                size_t chunk = tbytes - twritten;
+                if (chunk > 64) chunk = 64;
+                int w = client.write(tsrc + twritten, chunk);
+                if (w > 0) {
+                    twritten += (size_t)w;
+                } else {
+                    vTaskDelay(2 / portTICK_PERIOD_MS);
+                    if (millis() > tdeadline) break;
+                }
+            }
+            client.flush();
+            Serial.printf("Streamer: test pattern sent (%u/%u bytes)\n", (unsigned)twritten, (unsigned)tbytes);
+        }
+        // End sanity-test block
+
         // Stream loop: convert 32-bit stereo -> 16-bit mono (left), send in small chunks
         bool firstAudioSent = false;
         int consecutiveEmptySends = 0;
@@ -228,6 +259,14 @@ static void streamingTask(void *pvParameters) {
             // give WiFi stack a chance
             vTaskDelay(1 / portTICK_PERIOD_MS);
         }
+
+        // Ensure client is closed and log it
+        if (client) {
+            client.stop();
+        }
+        Serial.println("Streamer: client disconnected");
+        // brief pause before accepting next client
+        vTaskDelay(100 / portTICK_PERIOD_MS);
     }
 }
 
