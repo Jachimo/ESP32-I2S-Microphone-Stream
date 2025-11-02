@@ -179,8 +179,7 @@ static void streamingTask(void *pvParameters) {
             // convert the samples to μ-law bytes
             for (int i = 0; i < samples; ++i) {
                 int32_t s32 = i2s_read_buff[i];
-                // For μ-law: shift right by 8 to get 24 MSBs as 16-bit signed
-                int16_t s16 = (int16_t)(s32 >> 8);
+                int16_t s16 = (int16_t)(s32 >> 8);  // Shift right by 8 to get 24 MSBs, then cast to 16b int
                 sendbuf[i] = linear_to_mulaw(s16);
             }
 
@@ -262,6 +261,7 @@ static void streamingTask(void *pvParameters) {
                 total_sent_since_ts = 0;
                 ts = millis();
             }
+            // end throughput debug output
 
             // small yield to let lwIP and WiFi tasks run, avoid long sleeps
             taskYIELD();
