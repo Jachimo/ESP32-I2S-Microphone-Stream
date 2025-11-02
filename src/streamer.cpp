@@ -215,5 +215,6 @@ static void streamingTask(void *pvParameters) {
 }
 
 void start_streamer(void) {
-    xTaskCreatePinnedToCore(streamingTask, "streamingTask", 8192, NULL, 1, NULL, 1);
+    // Increase priority from 1 -> 4
+    xTaskCreatePinnedToCore(streamingTask, "streamingTask", 8192, NULL, 4, NULL, 1);
 }
