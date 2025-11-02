@@ -34,6 +34,11 @@ void I2SSetup(void) {
         return;
     }
     res = i2s_set_clk(I2S_PORT, i2s_config.sample_rate, i2s_config.bits_per_sample, I2S_CHANNEL_MONO);
+    Serial.printf("i2s_set_clk(sample_rate=%u, bits=%u, channels=%s) -> %d\n",
+        i2s_config.sample_rate,
+        (unsigned)i2s_config.bits_per_sample,
+        (I2S_CHANNEL_MONO == I2S_CHANNEL_MONO) ? "MONO" : "STEREO",
+        (int)res);
     if (res != ESP_OK) {
         Serial.printf("i2s_set_clk failed: %d\n", res);
     }

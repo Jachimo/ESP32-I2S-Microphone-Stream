@@ -128,15 +128,21 @@ static void streamingTask(void *pvParameters) {
         size_t i2s_samples_acc = 0;
         unsigned long last_i2s_read_us = 0;
 
-        // Send fixed-size chunks ~20ms of audio 
-        const int SAMPLES_PER_CHUNK = 160; // 20 ms @ 8 kHz = 160 bytes (μ-law)
+        // Send fixed-size chunks. Must not request more samples than driver DMA buffer.
+        // Ensure SAMPLES_PER_CHUNK <= AUDIO_DMA_BUF_LEN to avoid i2s_read blocking for multiple buffers.
+        const int SAMPLES_PER_CHUNK = (AUDIO_DMA_BUF_LEN <= 160) ? AUDIO_DMA_BUF_LEN : 128;
         uint8_t sendbuf[SAMPLES_PER_CHUNK];
 
         while (client && client.connected()) {
-            // Read exactly SAMPLES_PER_CHUNK samples (each sample is 1 32-bit slot from I2S)
-            size_t bytes_needed = SAMPLES_PER_CHUNK * sizeof(int32_t);
+            // Read up to SAMPLES_PER_CHUNK samples but never more than the DMA buffer length.
+            int samples_to_request = SAMPLES_PER_CHUNK;
+            if (samples_to_request > AUDIO_DMA_BUF_LEN) samples_to_request = AUDIO_DMA_BUF_LEN;
+            size_t bytes_needed = (size_t)samples_to_request * sizeof(int32_t);
             size_t bytes_read = 0;
-            esp_err_t r = i2s_read(I2S_PORT, i2s_read_buff, bytes_needed, &bytes_read, (SAMPLES_PER_CHUNK / 1000 + 40) / portTICK_PERIOD_MS);
+            // timeout: expected time for samples + safety margin (ms)
+            unsigned long timeout_ms = (unsigned long)((samples_to_request * 1000) / (double)AUDIO_SAMPLE_RATE) + 50;
+            if (timeout_ms < 50) timeout_ms = 50;
+            esp_err_t r = i2s_read(I2S_PORT, i2s_read_buff, bytes_needed, &bytes_read, timeout_ms / portTICK_PERIOD_MS);
             if (r != ESP_OK || bytes_read == 0) {
                 // no data available now; give WiFi/lwip time and retry quickly
                 vTaskDelay(2 / portTICK_PERIOD_MS);
@@ -173,6 +179,7 @@ static void streamingTask(void *pvParameters) {
             // convert the samples to μ-law bytes
             for (int i = 0; i < samples; ++i) {
                 int32_t s32 = i2s_read_buff[i];
+                // For μ-law: shift right by 8 to get 24 MSBs as 16-bit signed
                 int16_t s16 = (int16_t)(s32 >> 8);
                 sendbuf[i] = linear_to_mulaw(s16);
             }
