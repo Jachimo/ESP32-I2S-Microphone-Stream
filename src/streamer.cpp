@@ -123,6 +123,11 @@ static void streamingTask(void *pvParameters) {
         uint32_t write_count = 0;
         unsigned long dbg_ts = millis();
 
+        // I2S read instrumentation
+        unsigned long i2s_dbg_ts = millis();
+        size_t i2s_samples_acc = 0;
+        unsigned long last_i2s_read_us = 0;
+
         // Send fixed-size chunks ~20ms of audio 
         const int SAMPLES_PER_CHUNK = 160; // 20 ms @ 8 kHz = 160 bytes (μ-law)
         uint8_t sendbuf[SAMPLES_PER_CHUNK];
@@ -138,6 +143,30 @@ static void streamingTask(void *pvParameters) {
                 continue;
             }
 
+            // I2S read instrumentation
+            {
+                uint32_t now_us = micros();
+                if (last_i2s_read_us != 0) {
+                    uint32_t delta_us = (now_us >= last_i2s_read_us) ? (now_us - last_i2s_read_us) : (UINT32_MAX - last_i2s_read_us + now_us + 1);
+                    // print per-read timing occasionally (very verbose if done every read)
+                    // you can enable this line for very detailed debugging:
+                    // Serial.printf("I2S read: bytes=%u delta_us=%u\n", (unsigned)bytes_read, (unsigned)delta_us);
+                    (void)delta_us;
+                }
+                last_i2s_read_us = now_us;
+
+                // accumulate samples and report 1s statistics
+                int samples = bytes_read / sizeof(int32_t);
+                if (samples > 0) i2s_samples_acc += (size_t)samples;
+
+                if (millis() - i2s_dbg_ts >= 1000) {
+                    Serial.printf("I2S_STATS: samples/sec=%u, last_bytes_read=%u\n", (unsigned)i2s_samples_acc, (unsigned)bytes_read);
+                    i2s_samples_acc = 0;
+                    i2s_dbg_ts = millis();
+                }
+            }
+            // End I2S read instrumentation
+
             int samples = bytes_read / sizeof(int32_t);
             if (samples <= 0) continue;
 
@@ -150,7 +179,30 @@ static void streamingTask(void *pvParameters) {
 
             // send the chunk in one write (or retry briefly on EAGAIN)
             size_t written = 0;
-            unsigned long write_deadline = millis() + 200;
+            unsigned long write_deadline = millis() + 500; // overall per-chunk timeout
+
+            while (written < samples && client && client.connected()) {
+                int avail = client.availableForWrite(); // returns how many bytes lwIP tx buf can accept
+                if (avail <= 0) {
+                    // no room in socket send buffer right now — yield briefly and retry
+                    vTaskDelay(1 / portTICK_PERIOD_MS);
+                    if (millis() > write_deadline) break;
+                    continue;
+                }
+
+                // only write up to the available space
+                size_t toWrite = samples - written;
+                if ((size_t)avail < toWrite) toWrite = (size_t)avail;
+
+                int w = client.write(sendbuf + written, toWrite);
+                if (w > 0) {
+                    written += (size_t)w;
+                } else {
+                    // write returned 0 or negative; don't busy-loop
+                    vTaskDelay(1 / portTICK_PERIOD_MS);
+                    if (millis() > write_deadline) break;
+                }
+            }
 
             // Instrumentation
             // TODO: Remove when stable
@@ -215,6 +267,6 @@ static void streamingTask(void *pvParameters) {
 }
 
 void start_streamer(void) {
-    // Increase priority from 1 -> 4
-    xTaskCreatePinnedToCore(streamingTask, "streamingTask", 8192, NULL, 4, NULL, 1);
+    // TODO: NOTE: Priority set to 1 for debugging
+    xTaskCreatePinnedToCore(streamingTask, "streamingTask", 8192, NULL, 1, NULL, 1);
 }
