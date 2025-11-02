@@ -4,7 +4,7 @@
 #include <WiFi.h>
 #include <driver/i2s.h>
 
-// mu-law encoder for G.711 μ-law
+// G.711 μ-law encoder
 static inline uint8_t linear_to_mulaw(int16_t pcm_val) {
     const uint16_t BIAS = 0x84; // 132
     uint16_t mask;
@@ -27,7 +27,7 @@ static inline uint8_t linear_to_mulaw(int16_t pcm_val) {
     return uval;
 }
 
-static WiFiServer s_streamServer(8080);
+static WiFiServer s_streamServer(8080);  // change port here if desired
 
 static void streamingTask(void *pvParameters) {
     (void)pvParameters;
@@ -43,12 +43,13 @@ static void streamingTask(void *pvParameters) {
     // 16..19 Subchunk1Size = 16
     // 20..21 AudioFormat = 7 (mu-law)
     // 22..23 NumChannels = 1
-    // 24..27 SampleRate = 8000
-    // 28..31 ByteRate = SampleRate * NumChannels * BytesPerSample = 8000
+    // 24..27 SampleRate
+    // 28..31 ByteRate = SampleRate * NumChannels * BytesPerSample
     // 32..33 BlockAlign = 1
     // 34..35 BitsPerSample = 8
     // 36..39 "data"
     // 40..43 Subchunk2Size = 0xFFFFFFFF (unknown/streaming)
+
     uint8_t streamingWavHeader[44] = {
         'R','I','F','F',
         0xFF,0xFF,0xFF,0xFF,   // ChunkSize (unknown)
@@ -56,9 +57,9 @@ static void streamingTask(void *pvParameters) {
         'f','m','t',' ',
         0x10,0x00,0x00,0x00,   // Subchunk1Size = 16
         0x07,0x00,             // AudioFormat = 7 (mu-law)
-        0x01,0x00,             // NumChannels = 1
-        0x40,0x1F,0x00,0x00,   // SampleRate = 8000 (0x00001F40)
-        0x40,0x1F,0x00,0x00,   // ByteRate = 8000 (same as sample rate for 1B/sample)
+        0x01,0x00,             // NumChannels = 1 (Mono)
+        0x80,0x3E,0x00,0x00,   // SampleRate (match AUDIO_SAMPLE_RATE)
+        0x80,0x3E,0x00,0x00,   // ByteRate = 16000 (SampleRate * NumChannels * BytesPerSample)
         0x01,0x00,             // BlockAlign = 1
         0x08,0x00,             // BitsPerSample = 8
         'd','a','t','a',
@@ -106,7 +107,6 @@ static void streamingTask(void *pvParameters) {
         client.flush();
         Serial.println("Streamer: response headers & WAV header sent, entering stream loop");
 
-        // Stream loop: read, convert to μ-law and send small, regular packets (~20ms)
         size_t total_sent_since_ts = 0;
         unsigned long ts = millis();
 
