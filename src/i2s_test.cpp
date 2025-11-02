@@ -2,9 +2,9 @@
 #include <driver/i2s.h>
 
 // Pin mapping for Heltec WiFi Kit 32 + INMP441
-#define I2S_WS   25  // LRCL
+#define I2S_WS   25  // WS (aka LRCL)
 #define I2S_SD   32  // DOUT
-#define I2S_SCK  33  // BCLK
+#define I2S_SCK  26  // BCLK
 
 #define I2S_PORT I2S_NUM_0
 #define SAMPLE_RATE 16000
@@ -19,7 +19,7 @@ void setup() {
         .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
         .sample_rate = SAMPLE_RATE,
         .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
-        .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+        .channel_format = I2S_CHANNEL_FMT_ONLY_RIGHT,
         .communication_format = I2S_COMM_FORMAT_STAND_I2S,
         .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
         .dma_buf_count = 3,
@@ -50,15 +50,15 @@ void loop() {
     size_t bytes_read = 0;
     esp_err_t r = i2s_read(I2S_PORT, (void*)i2s_read_buff, sizeof(i2s_read_buff), &bytes_read, 1000 / portTICK_PERIOD_MS);
 
+    Serial.printf("i2s_read: r=%d bytes_read=%u\n", r, (unsigned)bytes_read);
     if (r == ESP_OK && bytes_read > 0) {
-        int samples = bytes_read / sizeof(int32_t);
-        Serial.printf("Read %d samples: ", samples);
-        for (int i = 0; i < min(samples, 8); ++i) {
-            Serial.printf("%ld ", i2s_read_buff[i]);
+        int samples = bytes_read / sizeof(int32_t);  // this is samples_read in ESPHome i2s_audio_microphone.cpp
+        for (int i = 0; i < samples; ++i) {
+            int16_t pcm16 = (int16_t)(i2s_read_buff[i] >> 8);
+            Serial.printf("%04X ", pcm16);
+            if ((i+1)%8 == 0) Serial.println();
         }
         Serial.println();
-    } else {
-        Serial.printf("i2s_read error: %d bytes_read: %u\n", r, (unsigned)bytes_read);
     }
     delay(500);
 }
