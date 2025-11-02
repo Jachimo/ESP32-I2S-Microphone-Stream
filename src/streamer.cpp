@@ -34,22 +34,7 @@ static void streamingTask(void *pvParameters) {
     const int i2s_read_len = AUDIO_DMA_BUF_LEN; // match DMA buffer
     int32_t i2s_read_buff[i2s_read_len];
 
-    // WAV header: 8 kHz, 8-bit μ-law, mono. WAVE format tag 7 = μ-law
-    // Layout (little-endian):
-    // 0..3   "RIFF"
-    // 4..7   ChunkSize (unknown -> 0xFFFFFFFF)
-    // 8..11  "WAVE"
-    // 12..15 "fmt "
-    // 16..19 Subchunk1Size = 16
-    // 20..21 AudioFormat = 7 (mu-law)
-    // 22..23 NumChannels = 1
-    // 24..27 SampleRate
-    // 28..31 ByteRate = SampleRate * NumChannels * BytesPerSample
-    // 32..33 BlockAlign = 1
-    // 34..35 BitsPerSample = 8
-    // 36..39 "data"
-    // 40..43 Subchunk2Size = 0xFFFFFFFF (unknown/streaming)
-
+    // WAV header: 16 kHz, 8-bit μ-law, mono. WAVE format tag 7 = μ-law
     uint8_t streamingWavHeader[44] = {
         'R','I','F','F',
         0xFF,0xFF,0xFF,0xFF,   // ChunkSize (unknown)
@@ -58,8 +43,8 @@ static void streamingTask(void *pvParameters) {
         0x10,0x00,0x00,0x00,   // Subchunk1Size = 16
         0x07,0x00,             // AudioFormat = 7 (mu-law)
         0x01,0x00,             // NumChannels = 1 (Mono)
-        0x80,0x3E,0x00,0x00,   // SampleRate (match AUDIO_SAMPLE_RATE)
-        0x80,0x3E,0x00,0x00,   // ByteRate = 16000 (SampleRate * NumChannels * BytesPerSample)
+        0x80,0x3E,0x00,0x00,   // SampleRate (16000)
+        0x80,0x3E,0x00,0x00,   // ByteRate = 16000
         0x01,0x00,             // BlockAlign = 1
         0x08,0x00,             // BitsPerSample = 8
         'd','a','t','a',
@@ -97,7 +82,7 @@ static void streamingTask(void *pvParameters) {
         }
         if (!firstLineLogged) Serial.println("Streamer: no request headers received (timeout), proceeding to respond");
 
-        // Send response headers + correct WAV header
+        // Send response headers + WAV header
         client.print("HTTP/1.1 200 OK\r\n");
         client.print("Content-Type: audio/wav\r\n");
         client.print("Cache-Control: no-cache\r\n");
@@ -110,26 +95,11 @@ static void streamingTask(void *pvParameters) {
         size_t total_sent_since_ts = 0;
         unsigned long ts = millis();
 
-        // Instrumentation for send timing debugging
-        // TODO: Remove when stable
-        uint32_t last_send_us = 0;
-        uint32_t min_interval_us = 0xFFFFFFFFu;
-        uint32_t max_interval_us = 0;
-        uint64_t sum_interval_us = 0;
-        uint32_t interval_count = 0;
-        uint32_t min_write_us = 0xFFFFFFFFu;
-        uint32_t max_write_us = 0;
-        uint64_t sum_write_us = 0;
-        uint32_t write_count = 0;
-        unsigned long dbg_ts = millis();
-
-        // I2S read instrumentation
+        // I2S read statistics
         unsigned long i2s_dbg_ts = millis();
         size_t i2s_samples_acc = 0;
-        unsigned long last_i2s_read_us = 0;
 
         // Send fixed-size chunks. Must not request more samples than driver DMA buffer.
-        // Ensure SAMPLES_PER_CHUNK <= AUDIO_DMA_BUF_LEN to avoid i2s_read blocking for multiple buffers.
         const int SAMPLES_PER_CHUNK = (AUDIO_DMA_BUF_LEN <= 160) ? AUDIO_DMA_BUF_LEN : 128;
         uint8_t sendbuf[SAMPLES_PER_CHUNK];
 
@@ -139,41 +109,23 @@ static void streamingTask(void *pvParameters) {
             if (samples_to_request > AUDIO_DMA_BUF_LEN) samples_to_request = AUDIO_DMA_BUF_LEN;
             size_t bytes_needed = (size_t)samples_to_request * sizeof(int32_t);
             size_t bytes_read = 0;
-            // timeout: expected time for samples + safety margin (ms)
             unsigned long timeout_ms = (unsigned long)((samples_to_request * 1000) / (double)AUDIO_SAMPLE_RATE) + 50;
             if (timeout_ms < 50) timeout_ms = 50;
             esp_err_t r = i2s_read(I2S_PORT, i2s_read_buff, bytes_needed, &bytes_read, timeout_ms / portTICK_PERIOD_MS);
             if (r != ESP_OK || bytes_read == 0) {
-                // no data available now; give WiFi/lwip time and retry quickly
                 vTaskDelay(2 / portTICK_PERIOD_MS);
                 continue;
             }
 
-            // I2S read instrumentation
-            {
-                uint32_t now_us = micros();
-                if (last_i2s_read_us != 0) {
-                    uint32_t delta_us = (now_us >= last_i2s_read_us) ? (now_us - last_i2s_read_us) : (UINT32_MAX - last_i2s_read_us + now_us + 1);
-                    // print per-read timing occasionally (very verbose if done every read)
-                    // you can enable this line for very detailed debugging:
-                    // Serial.printf("I2S read: bytes=%u delta_us=%u\n", (unsigned)bytes_read, (unsigned)delta_us);
-                    (void)delta_us;
-                }
-                last_i2s_read_us = now_us;
-
-                // accumulate samples and report 1s statistics
-                int samples = bytes_read / sizeof(int32_t);
-                if (samples > 0) i2s_samples_acc += (size_t)samples;
-
-                if (millis() - i2s_dbg_ts >= 1000) {
-                    Serial.printf("I2S_STATS: samples/sec=%u, last_bytes_read=%u\n", (unsigned)i2s_samples_acc, (unsigned)bytes_read);
-                    i2s_samples_acc = 0;
-                    i2s_dbg_ts = millis();
-                }
-            }
-            // End I2S read instrumentation
-
+            // I2S read statistics
             int samples = bytes_read / sizeof(int32_t);
+            if (samples > 0) i2s_samples_acc += (size_t)samples;
+            if (millis() - i2s_dbg_ts >= 1000) {
+                Serial.printf("I2S_STATS: samples/sec=%u, last_bytes_read=%u\n", (unsigned)i2s_samples_acc, (unsigned)bytes_read);
+                i2s_samples_acc = 0;
+                i2s_dbg_ts = millis();
+            }
+
             if (samples <= 0) continue;
 
             // convert the samples to μ-law bytes
@@ -188,71 +140,22 @@ static void streamingTask(void *pvParameters) {
             unsigned long write_deadline = millis() + 500; // overall per-chunk timeout
 
             while (written < samples && client && client.connected()) {
-                int avail = client.availableForWrite(); // returns how many bytes lwIP tx buf can accept
+                int avail = client.availableForWrite();
                 if (avail <= 0) {
-                    // no room in socket send buffer right now — yield briefly and retry
                     vTaskDelay(1 / portTICK_PERIOD_MS);
                     if (millis() > write_deadline) break;
                     continue;
                 }
-
-                // only write up to the available space
                 size_t toWrite = samples - written;
                 if ((size_t)avail < toWrite) toWrite = (size_t)avail;
-
                 int w = client.write(sendbuf + written, toWrite);
                 if (w > 0) {
                     written += (size_t)w;
                 } else {
-                    // write returned 0 or negative; don't busy-loop
                     vTaskDelay(1 / portTICK_PERIOD_MS);
                     if (millis() > write_deadline) break;
                 }
             }
-
-            // Instrumentation
-            // TODO: Remove when stable
-            {
-                uint32_t t_before = micros();
-                while (written < (size_t)samples && client && client.connected()) {
-                    int w = client.write(sendbuf + written, samples - written);
-                    if (w > 0) {
-                        written += (size_t)w;
-                    } else {
-                        vTaskDelay(1 / portTICK_PERIOD_MS);
-                        if (millis() > write_deadline) break;
-                    }
-                }
-                uint32_t t_after = micros();
-                uint32_t write_us = (t_after >= t_before) ? (t_after - t_before) : (UINT32_MAX - t_before + t_after + 1);
-                if (write_us < min_write_us) min_write_us = write_us;
-                if (write_us > max_write_us) max_write_us = write_us;
-                sum_write_us += write_us;
-                write_count++;
-
-                if (last_send_us != 0) {
-                    uint32_t interval_us = (t_before >= last_send_us) ? (t_before - last_send_us) : (UINT32_MAX - last_send_us + t_before + 1);
-                    if (interval_us < min_interval_us) min_interval_us = interval_us;
-                    if (interval_us > max_interval_us) max_interval_us = interval_us;
-                    sum_interval_us += interval_us;
-                    interval_count++;
-                }
-                last_send_us = t_after;
-
-                // periodic print once per second
-                if (millis() - dbg_ts >= 1000) {
-                    dbg_ts = millis();
-                    uint32_t avg_interval = interval_count ? (uint32_t)(sum_interval_us / interval_count) : 0;
-                    uint32_t avg_write = write_count ? (uint32_t)(sum_write_us / write_count) : 0;
-                    Serial.printf("SEND_STATS: interval min=%u us avg=%u us max=%u us, write min=%u us avg=%u us max=%u us\n",
-                        (unsigned)min_interval_us, (unsigned)avg_interval, (unsigned)max_interval_us,
-                        (unsigned)min_write_us, (unsigned)avg_write, (unsigned)max_write_us);
-                    // reset accumulators
-                    min_interval_us = 0xFFFFFFFFu; max_interval_us = 0; sum_interval_us = 0; interval_count = 0;
-                    min_write_us = 0xFFFFFFFFu; max_write_us = 0; sum_write_us = 0; write_count = 0;
-                }
-            }
-            // End instrumentation
 
             // throughput debug every 1s
             total_sent_since_ts += written;
@@ -261,9 +164,7 @@ static void streamingTask(void *pvParameters) {
                 total_sent_since_ts = 0;
                 ts = millis();
             }
-            // end throughput debug output
 
-            // small yield to let lwIP and WiFi tasks run, avoid long sleeps
             taskYIELD();
         }
 
@@ -274,6 +175,5 @@ static void streamingTask(void *pvParameters) {
 }
 
 void start_streamer(void) {
-    // TODO: NOTE: Priority set to 1 for debugging
     xTaskCreatePinnedToCore(streamingTask, "streamingTask", 8192, NULL, 1, NULL, 1);
 }
