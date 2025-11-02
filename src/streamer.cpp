@@ -110,7 +110,18 @@ static void streamingTask(void *pvParameters) {
         size_t total_sent_since_ts = 0;
         unsigned long ts = millis();
 
-        
+        // Instrumentation for send timing debugging
+        // TODO: Remove when stable
+        uint32_t last_send_us = 0;
+        uint32_t min_interval_us = 0xFFFFFFFFu;
+        uint32_t max_interval_us = 0;
+        uint64_t sum_interval_us = 0;
+        uint32_t interval_count = 0;
+        uint32_t min_write_us = 0xFFFFFFFFu;
+        uint32_t max_write_us = 0;
+        uint64_t sum_write_us = 0;
+        uint32_t write_count = 0;
+        unsigned long dbg_ts = millis();
 
         // Send fixed-size chunks ~20ms of audio 
         const int SAMPLES_PER_CHUNK = 160; // 20 ms @ 8 kHz = 160 bytes (μ-law)
@@ -140,18 +151,53 @@ static void streamingTask(void *pvParameters) {
             // send the chunk in one write (or retry briefly on EAGAIN)
             size_t written = 0;
             unsigned long write_deadline = millis() + 200;
-            while (written < (size_t)samples && client && client.connected()) {
-                int w = client.write(sendbuf + written, samples - written);
-                if (w > 0) {
-                    written += (size_t)w;
-                } else {
-                    vTaskDelay(1 / portTICK_PERIOD_MS);
-                    if (millis() > write_deadline) break;
+
+            // Instrumentation
+            // TODO: Remove when stable
+            {
+                uint32_t t_before = micros();
+                while (written < (size_t)samples && client && client.connected()) {
+                    int w = client.write(sendbuf + written, samples - written);
+                    if (w > 0) {
+                        written += (size_t)w;
+                    } else {
+                        vTaskDelay(1 / portTICK_PERIOD_MS);
+                        if (millis() > write_deadline) break;
+                    }
+                }
+                uint32_t t_after = micros();
+                uint32_t write_us = (t_after >= t_before) ? (t_after - t_before) : (UINT32_MAX - t_before + t_after + 1);
+                if (write_us < min_write_us) min_write_us = write_us;
+                if (write_us > max_write_us) max_write_us = write_us;
+                sum_write_us += write_us;
+                write_count++;
+
+                if (last_send_us != 0) {
+                    uint32_t interval_us = (t_before >= last_send_us) ? (t_before - last_send_us) : (UINT32_MAX - last_send_us + t_before + 1);
+                    if (interval_us < min_interval_us) min_interval_us = interval_us;
+                    if (interval_us > max_interval_us) max_interval_us = interval_us;
+                    sum_interval_us += interval_us;
+                    interval_count++;
+                }
+                last_send_us = t_after;
+
+                // periodic print once per second
+                if (millis() - dbg_ts >= 1000) {
+                    dbg_ts = millis();
+                    uint32_t avg_interval = interval_count ? (uint32_t)(sum_interval_us / interval_count) : 0;
+                    uint32_t avg_write = write_count ? (uint32_t)(sum_write_us / write_count) : 0;
+                    Serial.printf("SEND_STATS: interval min=%u us avg=%u us max=%u us, write min=%u us avg=%u us max=%u us\n",
+                        (unsigned)min_interval_us, (unsigned)avg_interval, (unsigned)max_interval_us,
+                        (unsigned)min_write_us, (unsigned)avg_write, (unsigned)max_write_us);
+                    // reset accumulators
+                    min_interval_us = 0xFFFFFFFFu; max_interval_us = 0; sum_interval_us = 0; interval_count = 0;
+                    min_write_us = 0xFFFFFFFFu; max_write_us = 0; sum_write_us = 0; write_count = 0;
                 }
             }
+            // End instrumentation
 
-            total_sent_since_ts += written;
             // throughput debug every 1s
+            total_sent_since_ts += written;
             if (millis() - ts >= 1000) {
                 Serial.printf("Streamer throughput: %u B/s\n", (unsigned)total_sent_since_ts);
                 total_sent_since_ts = 0;
