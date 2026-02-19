@@ -4,15 +4,20 @@
 #include <driver/i2s.h>
 
 void I2SSetup(void) {
+    Serial.println("I2SSetup: Starting I2S configuration...");
+    
     i2s_config_t i2s_config = {
         .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
         .sample_rate = AUDIO_SAMPLE_RATE,
         .bits_per_sample = AUDIO_BITS_PER_SAMPLE,
-        .channel_format = I2S_CHANNEL_FMT_ONLY_RIGHT,
-        .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+        .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,  // Read BOTH channels
+        .communication_format = (i2s_comm_format_t)I2S_COMM_FORMAT_I2S,  // Changed from STAND_I2S
         .intr_alloc_flags = 0,
         .dma_buf_count = AUDIO_DMA_BUF_COUNT,
         .dma_buf_len = AUDIO_DMA_BUF_LEN,
+        .use_apll = true,  // Use APLL for more accurate clock generation
+        .tx_desc_auto_clear = false,
+        .fixed_mclk = 0
     };
 
     i2s_pin_config_t pin_config = {
@@ -23,26 +28,28 @@ void I2SSetup(void) {
         .data_in_num  = MIC_SDOUT
     };
 
+    Serial.println("I2SSetup: Installing I2S driver...");
     esp_err_t res = i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL);
+    Serial.printf("I2SSetup: i2s_driver_install() -> %d\n", res);
     if (res != ESP_OK) {
         Serial.printf("i2s_driver_install failed: %d\n", res);
         return;
     }
+    
+    Serial.println("I2SSetup: Setting I2S pins...");
     res = i2s_set_pin(I2S_PORT, &pin_config);
+    Serial.printf("I2SSetup: i2s_set_pin() -> %d\n", res);
     if (res != ESP_OK) {
         Serial.printf("i2s_set_pin failed: %d\n", res);
         return;
     }
-    res = i2s_set_clk(I2S_PORT, i2s_config.sample_rate, i2s_config.bits_per_sample, I2S_CHANNEL_STEREO);
-    Serial.printf("i2s_set_clk(sample_rate=%u, bits=%u, channels=%s) -> %d\n",
-        i2s_config.sample_rate,
-        (unsigned)i2s_config.bits_per_sample,
-        "STEREO",
-        (int)res);
-    if (res != ESP_OK) {
-        Serial.printf("i2s_set_clk failed: %d\n", res);
-    }
+    
+    // NOTE: Removed i2s_set_clk() call - let driver auto-configure from i2s_config
+    Serial.println("I2SSetup: Clock auto-configured from i2s_config");
+    
+    Serial.println("I2SSetup: Zeroing DMA buffer...");
     i2s_zero_dma_buffer(I2S_PORT);
+    Serial.println("I2SSetup: Complete!");
 }
 
 void I2SSelfTest(void) {
@@ -55,7 +62,7 @@ void I2SSelfTest(void) {
     if (r == ESP_OK && bytes_read > 0) {
         int samples = bytes_read / sizeof(int32_t);
         int dump = samples < 8 ? samples : 8;
-        Serial.print("Self-test samples (left only): ");
+        Serial.print("Self-test samples (L/R alternating): ");
         for (int i = 0; i < dump; ++i) {
             uint32_t v = (uint32_t)test_buf[i];
             Serial.printf("%08X ", v);

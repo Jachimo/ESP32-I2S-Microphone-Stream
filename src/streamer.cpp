@@ -129,31 +129,49 @@ static void streamingTask(void *pvParameters) {
             if (samples <= 0) continue;
 
             // convert the samples to μ-law bytes
-            for (int i = 0; i < samples; ++i) {
-                int32_t s32 = i2s_read_buff[i];
+            // With RIGHT_LEFT format, samples alternate: left, right, left, right...
+            // INMP441 L/R=GND means audio is on LEFT channel (even indices: 0,2,4,6...)
+            int output_samples = samples / 2;  // We only use left channel
+            for (int i = 0; i < output_samples; ++i) {
+                int32_t s32 = i2s_read_buff[i * 2];  // Extract only left channel (even indices)
                 int16_t s16 = (int16_t)(s32 >> 8);  // Shift right by 8 to get 24 MSBs, then cast to 16b int
                 sendbuf[i] = linear_to_mulaw(s16);
             }
+            samples = output_samples;  // Update samples count for the write loop
 
             // send the chunk in one write (or retry briefly on EAGAIN)
             size_t written = 0;
             unsigned long write_deadline = millis() + 500; // overall per-chunk timeout
+            static int debug_counter = 0;
+            bool debug_this_write = (++debug_counter % 100 == 0); // Debug every 100th write
 
             while (written < samples && client && client.connected()) {
                 int avail = client.availableForWrite();
+                if (debug_this_write && written == 0) {
+                    Serial.printf("DEBUG: samples=%d, avail=%d\n", samples, avail);
+                }
                 if (avail <= 0) {
                     vTaskDelay(1 / portTICK_PERIOD_MS);
-                    if (millis() > write_deadline) break;
+                    if (millis() > write_deadline) {
+                        if (debug_this_write) Serial.println("DEBUG: Write timeout!");
+                        break;
+                    }
                     continue;
                 }
                 size_t toWrite = samples - written;
                 if ((size_t)avail < toWrite) toWrite = (size_t)avail;
                 int w = client.write(sendbuf + written, toWrite);
+                if (debug_this_write && w > 0) {
+                    Serial.printf("DEBUG: Wrote %d bytes\n", w);
+                }
                 if (w > 0) {
                     written += (size_t)w;
                 } else {
                     vTaskDelay(1 / portTICK_PERIOD_MS);
-                    if (millis() > write_deadline) break;
+                    if (millis() > write_deadline) {
+                        if (debug_this_write) Serial.println("DEBUG: Write timeout (w<=0)!");
+                        break;
+                    }
                 }
             }
 
